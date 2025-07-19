@@ -4,6 +4,9 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from openai import OpenAI, APIError
 from weaviate.classes.init import Auth
+from weaviate import WeaviateClient
+from weaviate.auth import AuthApiKey
+from weaviate.config import Config
 import weaviate
 import os
 import re
@@ -44,12 +47,13 @@ if not all([OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY]):
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-weaviate_client = weaviate.connect_to_weaviate_cloud(
+auth = AuthApiKey(api_key=WEAVIATE_API_KEY)
+config = Config(
     cluster_url=WEAVIATE_CLUSTER_URL,
-    auth_credentials=Auth.api_key(WEAVIATE_API_KEY),
+    auth_credentials=auth,
     headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
-    skip_init_checks=True
 )
+weaviate_client = WeaviateClient(config)
 
 # Load content dictionaries
 with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
