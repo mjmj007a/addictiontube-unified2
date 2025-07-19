@@ -3,6 +3,7 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from openai import OpenAI, APIError
+from weaviate.classes.init import Auth
 import weaviate
 import os
 import re
@@ -45,7 +46,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 weaviate_client = weaviate.connect_to_weaviate_cloud(
     cluster_url=WEAVIATE_CLUSTER_URL,
-    auth_credentials=weaviate.Auth.api_key(WEAVIATE_API_KEY),
+    auth_credentials=Auth.api_key(WEAVIATE_API_KEY),
     headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
     skip_init_checks=True
 )
