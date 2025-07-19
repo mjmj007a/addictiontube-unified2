@@ -3,11 +3,8 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from openai import OpenAI, APIError
-from weaviate.classes.init import Auth
-from weaviate import WeaviateClient
-from weaviate.auth import AuthApiKey
-from weaviate.config import Config
 import weaviate
+from weaviate.auth import AuthApiKey
 import os
 import re
 import json
@@ -36,35 +33,45 @@ limiter = Limiter(
     headers_enabled=True,
 )
 
-# Load env vars and clients
+# Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEAVIATE_CLUSTER_URL = os.getenv("WEAVIATE_CLUSTER_URL")
 WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
 
 if not all([OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY]):
+    logger.error("Missing one or more required environment variables.")
     raise EnvironmentError("Missing one or more required environment variables.")
 
+# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-auth = Auth.api_key(WEAVIATE_API_KEY)
-
-weaviate_client = WeaviateClient(
-    url=WEAVIATE_CLUSTER_URL,
-    auth_credentials=auth,
-    headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
-    skip_init_checks=True
-)
+# Initialize Weaviate client for WCS
+try:
+    weaviate_client = weaviate.connect_to_wcs(
+        cluster_url=WEAVIATE_CLUSTER_URL,
+        auth_credentials=AuthApiKey(WEAVIATE_API_KEY),
+        headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
+        skip_init_checks=True
+    )
+except Exception as e:
+    logger.error(f"Failed to initialize Weaviate client: {str(e)}")
+    raise
 
 # Load content dictionaries
-with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
-    song_dict = {item['video_id']: item['song'] for item in json.load(f)}
-with open('videos_revised_with_poems-july04.json', 'r', encoding='utf-8') as f:
-    poem_dict = {item['video_id']: item['poem'] for item in json.load(f)}
-with open('stories.json', 'r', encoding='utf-8') as f:
-    story_dict = {item['id']: item['text'] for item in json.load(f)}
+try:
+    with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
+        song_dict = {item['video_id']: item['song'] for item in json.load(f)}
+    with open('videos_revised_with_poems-july04.json', 'r', encoding='utf-8') as f:
+        poem_dict = {item['video_id']: item['poem'] for item in json.load(f)}
+    with open('stories.json', 'r', encoding='utf-8') as f:
+        story_dict = {item['id']: item['text'] for item in json.load(f)}
+except Exception as e:
+    logger.error(f"Failed to load content dictionaries: {str(e)}")
+    raise
 
 def strip_html(text):
+    """Remove HTML tags from text."""
     return re.sub(r'<[^>]+>', '', text or '') if text else ''
 
 @app.route('/', methods=['GET', 'HEAD'])
@@ -88,6 +95,7 @@ def search_content():
     size = max(1, min(100, int(request.args.get('per_page', 5))))
 
     if not query or content_type not in ['songs', 'poems', 'stories']:
+        logger.warning(f"Invalid request: query={query}, content_type={content_type}")
         return jsonify({"error": "Invalid or missing query or content type"}), 400
 
     valid_categories = {
@@ -96,29 +104,39 @@ def search_content():
         'stories': ['1028', '1042']
     }
     if category != 'all' and category not in valid_categories[content_type]:
+        logger.warning(f"Invalid category: {category} for content_type={content_type}")
         return jsonify({"error": "Invalid category for selected content type"}), 400
 
     try:
+        # Generate embedding for the query
         embedding = client.embeddings.create(input=query, model="text-embedding-ada-002")
         vector = embedding.data[0].embedding
 
+        # Query Weaviate
         collection = weaviate_client.collections.get("Content")
-        filters = {}
+        filters = None
         if category != 'all':
+            from weaviate.classes.query import Filter
             key = "category_id" if content_type in ['songs', 'poems'] else "category"
-            filters = {"path": [key], "operator": "Equal", "valueText": category}
+            filters = Filter.by_property(key).equal(category)
 
-        results = collection.query.near_vector(vector=vector, limit=size * page, filters=filters)
+        results = collection.query.near_vector(
+            near_vector=vector,
+            limit=size * page,
+            filters=filters,
+            return_metadata=["distance"]
+        )
 
-        paginated = results.objects[(page - 1)*size : page*size]
+        # Paginate results
+        paginated = results.objects[(page - 1) * size: page * size]
         items = []
-        for o in paginated:
+        for obj in paginated:
             item = {
-                "id": o.uuid,
-                "score": o.distance,
-                "title": strip_html(o.properties.get("title", "")),
-                "description": strip_html(o.properties.get("description", "")),
-                "image": o.properties.get("image", "")
+                "id": str(obj.uuid),
+                "score": obj.metadata.distance,
+                "title": strip_html(obj.properties.get("title", "")),
+                "description": strip_html(obj.properties.get("description", "")),
+                "image": obj.properties.get("image", "")
             }
             items.append(item)
 
@@ -136,6 +154,7 @@ def rag_answer_content():
     reroll = request.args.get('reroll', '').lower().startswith('yes')
 
     if not query or content_type not in ['songs', 'poems', 'stories']:
+        logger.warning(f"Invalid RAG request: query={query}, content_type={content_type}")
         return jsonify({"error": "Invalid or missing query or content type"}), 400
 
     valid_categories = {
@@ -144,31 +163,42 @@ def rag_answer_content():
         'stories': ['1028', '1042']
     }
     if category != 'all' and category not in valid_categories[content_type]:
+        logger.warning(f"Invalid category: {category} for content_type={content_type}")
         return jsonify({"error": "Invalid category for selected content type"}), 400
 
     try:
+        # Generate embedding for the query
         embedding = client.embeddings.create(input=query, model="text-embedding-ada-002")
         vector = embedding.data[0].embedding
 
+        # Query Weaviate
         collection = weaviate_client.collections.get("Content")
-        filters = {}
+        filters = None
         if category != 'all':
+            from weaviate.classes.query import Filter
             key = "category_id" if content_type in ['songs', 'poems'] else "category"
-            filters = {"path": [key], "operator": "Equal", "valueText": category}
+            filters = Filter.by_property(key).equal(category)
 
-        results = collection.query.near_vector(vector=vector, limit=5, filters=filters)
+        results = collection.query.near_vector(
+            near_vector=vector,
+            limit=5,
+            filters=filters,
+            return_metadata=["distance"]
+        )
+
         matches = results.objects
         if reroll:
             random.shuffle(matches)
 
+        # Load content dictionary
         content_dict = {'songs': song_dict, 'poems': poem_dict, 'stories': story_dict}
         encoding = tiktoken.get_encoding("cl100k_base")
-        max_tokens = 16384 - 1000
+        max_tokens = 16384 - 1000  # Reserve tokens for response
         total_tokens = 0
         context_docs = []
 
         for obj in matches:
-            doc = strip_html(content_dict[content_type].get(obj.uuid, obj.properties.get("description", "")))[:3000]
+            doc = strip_html(content_dict[content_type].get(str(obj.uuid), obj.properties.get("description", "")))[:3000]
             token_len = len(encoding.encode(doc))
             if total_tokens + token_len <= max_tokens:
                 context_docs.append(doc)
@@ -177,14 +207,16 @@ def rag_answer_content():
                 break
 
         if not context_docs:
+            logger.warning("No usable context data found for RAG")
             return jsonify({"error": "No usable context data found"}), 404
 
+        # Generate RAG response
         context_text = "\n\n---\n\n".join(context_docs)
         system_prompt = f"You are an expert assistant for addiction recovery {content_type}."
         user_prompt = f"""Use the following {content_type} to answer the question.\n\n{context_text}\n\nQuestion: {query}\nAnswer:"""
 
         response = client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4o",  # Updated to a more recent model
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
