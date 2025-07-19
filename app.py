@@ -47,13 +47,14 @@ if not all([OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY]):
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-auth = AuthApiKey(api_key=WEAVIATE_API_KEY)
-config = Config(
-    cluster_url=WEAVIATE_CLUSTER_URL,
+auth = Auth.api_key(WEAVIATE_API_KEY)
+
+weaviate_client = WeaviateClient(
+    url=WEAVIATE_CLUSTER_URL,
     auth_credentials=auth,
     headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
+    skip_init_checks=True
 )
-weaviate_client = WeaviateClient(config)
 
 # Load content dictionaries
 with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
