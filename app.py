@@ -109,7 +109,7 @@ def search_content():
 
     try:
         # Generate embedding for the query
-        embedding = client.embeddings.create(input=query, model="text-embedding-ada-002")
+        embedding = client.embeddings.create(input=query, model="text-embedding-3-small")
         vector = embedding.data[0].embedding
 
         # Query Weaviate
@@ -168,7 +168,7 @@ def rag_answer_content():
 
     try:
         # Generate embedding for the query
-        embedding = client.embeddings.create(input=query, model="text-embedding-ada-002")
+        embedding = client.embeddings.create(input=query, model="text-embedding-3-small")
         vector = embedding.data[0].embedding
 
         # Query Weaviate
