@@ -15,8 +15,6 @@ from dotenv import load_dotenv
 import random
 import nltk
 import time
-import atexit
-import contextlib
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://addictiontube.com", "http://addictiontube.com"]}})
@@ -51,9 +49,7 @@ except Exception as e:
     logger.error(f"Failed to initialize OpenAI client: {str(e)}")
     raise
 
-weaviate_client = None
-def init_weaviate_client():
-    global weaviate_client
+def get_client():
     for attempt in range(3):
         try:
             weaviate_client = weaviate.connect_to_wcs(
@@ -64,7 +60,7 @@ def init_weaviate_client():
             )
             if weaviate_client.is_ready():
                 logger.info("Weaviate client initialized and ready")
-                return
+                return weaviate_client
             else:
                 logger.warning("Weaviate client initialized but not ready")
                 weaviate_client.close()
@@ -73,14 +69,6 @@ def init_weaviate_client():
             time.sleep(2)
     logger.error("Failed to initialize Weaviate client after 3 attempts")
     raise EnvironmentError("Weaviate client initialization failed")
-
-init_weaviate_client()
-
-def cleanup():
-    if weaviate_client:
-        weaviate_client.close()
-        logger.info("Weaviate client closed during shutdown")
-atexit.register(cleanup)
 
 try:
     with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
@@ -116,19 +104,18 @@ def preprocess_query(query):
     logger.warning(f"No lemmatizer available, using raw query: {query}")
     return query.lower()
 
-@contextlib.contextmanager
-def weaviate_connection():
-    if not weaviate_client.is_ready():
-        logger.warning("Weaviate client not ready, attempting reconnect")
-        init_weaviate_client()
-    yield weaviate_client
-
 @app.route('/', methods=['GET', 'HEAD'])
 def health_check():
     logger.info("Health check endpoint accessed")
-    if not weaviate_client.is_ready():
-        init_weaviate_client()
-    return jsonify({"status": "ok", "message": "AddictionTube Unified API is running"}), 200
+    client = get_client()
+    try:
+        if not client.is_ready():
+            logger.warning("Weaviate client not ready")
+            return jsonify({"error": "Weaviate client not ready", "details": "Client initialized but not ready"}), 503
+        return jsonify({"status": "ok", "message": "AddictionTube Unified API is running"}), 200
+    finally:
+        client.close()
+        logger.info("Weaviate client closed after health check")
 
 @app.errorhandler(429)
 def ratelimit_handler(e):
@@ -153,46 +140,45 @@ def search_content():
         logger.warning(f"Invalid request: query={query}, content_type={content_type}")
         return jsonify({"error": "Invalid or missing query or content type"}), 400
 
+    client = get_client()
     try:
         start_time = time.time()
         processed_query = preprocess_query(query)
         embedding = client.embeddings.create(input=processed_query, model="text-embedding-3-small")
         vector = embedding.data[0].embedding
 
-        with weaviate_connection():
-            collection = weaviate_client.collections.get("Content")
-            from weaviate.classes.query import Filter
-            filters = Filter.by_property("type").equal(content_type)
+        collection = client.collections.get("Content")
+        from weaviate.classes.query import Filter
+        filters = Filter.by_property("type").equal(content_type)
 
-            results = collection.query.near_vector(
-                near_vector=vector,
-                limit=size * page + 10,
-                filters=filters,
-                return_metadata=["distance"]
-            )
+        results = collection.query.near_vector(
+            near_vector=vector,
+            limit=size * page + 10,
+            filters=filters,
+            return_metadata=["distance"]
+        )
 
-            paginated = results.objects[(page - 1) * size: page * size]
-            items = []
-            for obj in paginated:
-                item = {
-                    "id": obj.properties.get("content_id", str(obj.uuid)),
-                    "score": obj.metadata.distance,
-                    "title": strip_html(obj.properties.get("title", "N/A")),
-                    "description": strip_html(obj.properties.get("description", "")),
-                    "image": obj.properties.get("image", "") if content_type == 'stories' else ""
-                }
-                items.append(item)
+        paginated = results.objects[(page - 1) * size: page * size]
+        items = []
+        for obj in paginated:
+            item = {
+                "id": obj.properties.get("content_id", str(obj.uuid)),
+                "score": obj.metadata.distance,
+                "title": strip_html(obj.properties.get("title", "N/A")),
+                "description": strip_html(obj.properties.get("description", "")),
+                "image": obj.properties.get("image", "") if content_type == 'stories' else ""
+            }
+            items.append(item)
 
         response = {"results": items, "total": len(results.objects)}
         logger.info(f"Search success: {len(items)} items returned, total={len(results.objects)}, time={time.time() - start_time:.2f}s")
         return jsonify(response)
-    except weaviate.exceptions.WeaviateClosedClientError as e:
-        logger.error(f"Weaviate client closed: {str(e)}")
-        init_weaviate_client()
-        return jsonify({"error": "Weaviate client closed, reconnected", "details": str(e)}), 503
     except Exception as e:
         logger.error(f"Weaviate search error: {str(e)}")
         return jsonify({"error": "Search failed", "details": str(e)}), 500
+    finally:
+        client.close()
+        logger.info("Weaviate client closed after search_content")
 
 @app.route('/rag_answer_content', methods=['GET'])
 @limiter.limit("30 per hour")
@@ -208,27 +194,27 @@ def rag_answer_content():
         logger.warning(f"Invalid RAG request: query={query}, content_type={content_type}")
         return jsonify({"error": "Invalid or missing query or content type"}), 400
 
+    client = get_client()
     try:
         start_time = time.time()
         processed_query = preprocess_query(query)
         embedding = client.embeddings.create(input=processed_query, model="text-embedding-3-small")
         vector = embedding.data[0].embedding
 
-        with weaviate_connection():
-            collection = weaviate_client.collections.get("Content")
-            from weaviate.classes.query import Filter
-            filters = Filter.by_property("type").equal(content_type)
+        collection = client.collections.get("Content")
+        from weaviate.classes.query import Filter
+        filters = Filter.by_property("type").equal(content_type)
 
-            results = collection.query.near_vector(
-                near_vector=vector,
-                limit=10,
-                filters=filters,
-                return_metadata=["distance"]
-            )
+        results = collection.query.near_vector(
+            near_vector=vector,
+            limit=10,
+            filters=filters,
+            return_metadata=["distance"]
+        )
 
-            matches = results.objects
-            if reroll:
-                random.shuffle(matches)
+        matches = results.objects
+        if reroll:
+            random.shuffle(matches)
 
         content_dict = {'songs': song_dict, 'poems': poem_dict, 'stories': story_dict}
         encoding = tiktoken.get_encoding("cl100k_base")
@@ -264,13 +250,12 @@ def rag_answer_content():
         answer = response.choices[0].message.content
         logger.info(f"RAG success: Answer generated for query={query}, content_type={content_type}, time={time.time() - start_time:.2f}s")
         return jsonify({"answer": answer})
-    except weaviate.exceptions.WeaviateClosedClientError as e:
-        logger.error(f"Weaviate client closed: {str(e)}")
-        init_weaviate_client()
-        return jsonify({"error": "Weaviate client closed, reconnected", "details": str(e)}), 503
     except Exception as e:
         logger.error(f"RAG failed: {str(e)}")
         return jsonify({"error": "RAG processing failed", "details": str(e)}), 500
+    finally:
+        client.close()
+        logger.info("Weaviate client closed after rag_answer_content")
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
