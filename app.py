@@ -15,8 +15,8 @@ from dotenv import load_dotenv
 import random
 import nltk
 import time
+import atexit
 import contextlib
-import timeout_decorator
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://addictiontube.com", "http://addictiontube.com"]}})
@@ -52,22 +52,35 @@ except Exception as e:
     raise
 
 weaviate_client = None
-for attempt in range(3):
-    try:
-        weaviate_client = weaviate.connect_to_wcs(
-            cluster_url=WEAVIATE_CLUSTER_URL,
-            auth_credentials=AuthApiKey(WEAVIATE_API_KEY),
-            headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
-            skip_init_checks=True
-        )
-        logger.info("Weaviate client initialized successfully")
-        break
-    except Exception as e:
-        logger.error(f"Weaviate client initialization attempt {attempt + 1} failed: {str(e)}")
-        time.sleep(2)
-if weaviate_client is None:
+def init_weaviate_client():
+    global weaviate_client
+    for attempt in range(3):
+        try:
+            weaviate_client = weaviate.connect_to_wcs(
+                cluster_url=WEAVIATE_CLUSTER_URL,
+                auth_credentials=AuthApiKey(WEAVIATE_API_KEY),
+                headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
+                skip_init_checks=False
+            )
+            if weaviate_client.is_ready():
+                logger.info("Weaviate client initialized and ready")
+                return
+            else:
+                logger.warning("Weaviate client initialized but not ready")
+                weaviate_client.close()
+        except Exception as e:
+            logger.error(f"Weaviate client initialization attempt {attempt + 1} failed: {str(e)}")
+            time.sleep(2)
     logger.error("Failed to initialize Weaviate client after 3 attempts")
     raise EnvironmentError("Weaviate client initialization failed")
+
+init_weaviate_client()
+
+def cleanup():
+    if weaviate_client:
+        weaviate_client.close()
+        logger.info("Weaviate client closed during shutdown")
+atexit.register(cleanup)
 
 try:
     with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
@@ -105,16 +118,16 @@ def preprocess_query(query):
 
 @contextlib.contextmanager
 def weaviate_connection():
-    try:
-        yield weaviate_client
-    finally:
-        if weaviate_client:
-            weaviate_client.close()
-            logger.info("Weaviate client connection closed")
+    if not weaviate_client.is_ready():
+        logger.warning("Weaviate client not ready, attempting reconnect")
+        init_weaviate_client()
+    yield weaviate_client
 
 @app.route('/', methods=['GET', 'HEAD'])
 def health_check():
     logger.info("Health check endpoint accessed")
+    if not weaviate_client.is_ready():
+        init_weaviate_client()
     return jsonify({"status": "ok", "message": "AddictionTube Unified API is running"}), 200
 
 @app.errorhandler(429)
@@ -125,7 +138,6 @@ def ratelimit_handler(e):
         "details": f"Too many requests. Please wait and try again. Limit: {e.description}"
     }), 429
 
-@timeout_decorator.timeout(60, timeout_exception=TimeoutError)
 @app.route('/search_content', methods=['GET'])
 @limiter.limit("60 per hour")
 def search_content():
@@ -174,14 +186,14 @@ def search_content():
         response = {"results": items, "total": len(results.objects)}
         logger.info(f"Search success: {len(items)} items returned, total={len(results.objects)}, time={time.time() - start_time:.2f}s")
         return jsonify(response)
-    except TimeoutError:
-        logger.error("Search timed out after 60 seconds")
-        return jsonify({"error": "Search timed out", "details": "Request took too long to process"}), 504
+    except weaviate.exceptions.WeaviateClosedClientError as e:
+        logger.error(f"Weaviate client closed: {str(e)}")
+        init_weaviate_client()
+        return jsonify({"error": "Weaviate client closed, reconnected", "details": str(e)}), 503
     except Exception as e:
         logger.error(f"Weaviate search error: {str(e)}")
         return jsonify({"error": "Search failed", "details": str(e)}), 500
 
-@timeout_decorator.timeout(60, timeout_exception=TimeoutError)
 @app.route('/rag_answer_content', methods=['GET'])
 @limiter.limit("30 per hour")
 def rag_answer_content():
@@ -252,9 +264,10 @@ def rag_answer_content():
         answer = response.choices[0].message.content
         logger.info(f"RAG success: Answer generated for query={query}, content_type={content_type}, time={time.time() - start_time:.2f}s")
         return jsonify({"answer": answer})
-    except TimeoutError:
-        logger.error("RAG timed out after 60 seconds")
-        return jsonify({"error": "RAG timed out", "details": "Request took too long to process"}), 504
+    except weaviate.exceptions.WeaviateClosedClientError as e:
+        logger.error(f"Weaviate client closed: {str(e)}")
+        init_weaviate_client()
+        return jsonify({"error": "Weaviate client closed, reconnected", "details": str(e)}), 503
     except Exception as e:
         logger.error(f"RAG failed: {str(e)}")
         return jsonify({"error": "RAG processing failed", "details": str(e)}), 500
