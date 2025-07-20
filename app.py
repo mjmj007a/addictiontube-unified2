@@ -4,7 +4,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from openai import OpenAI, APIError
 import weaviate
-from weaviate.auth import AuthApiKey
+from weaviate.classes.init import Auth
 import os
 import re
 import json
@@ -16,6 +16,7 @@ import random
 import nltk
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential
+import requests
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://addictiontube.com", "http://addictiontube.com"]}})
@@ -40,26 +41,40 @@ WEAVIATE_CLUSTER_URL = os.getenv("WEAVIATE_CLUSTER_URL")
 WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
 
 if not all([OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY]):
-    logger.error("Missing one or more required environment variables.")
-    raise EnvironmentError("Missing one or more required environment variables.")
+    logger.error("Missing one or more required environment variables: OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY")
+    raise EnvironmentError("Missing one or more required environment variables")
 
 try:
     client = OpenAI(api_key=OPENAI_API_KEY)
     logger.info("OpenAI client initialized successfully")
 except Exception as e:
-    logger.error(f"Failed to initialize OpenAI client: {str(e)}")
+    logger.error(f"Failed to initialize OpenAI client: {str(e)}", exc_info=True)
     raise
 
 def get_client():
     for attempt in range(3):
         try:
-            weaviate_client = weaviate.Client(
-                url=WEAVIATE_CLUSTER_URL,
-                auth_client_secret=AuthApiKey(WEAVIATE_API_KEY),
-                additional_headers={"X-OpenAI-Api-Key": OPENAI_API_KEY}
+            weaviate_client = weaviate.connect_to_weaviate_cloud(
+                cluster_url=WEAVIATE_CLUSTER_URL,
+                auth_credentials=Auth.api_key(WEAVIATE_API_KEY),
+                headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
+                skip_init_checks=False
             )
             if weaviate_client.is_ready():
                 logger.info("Weaviate client initialized and ready")
+                # Log Weaviate server version
+                try:
+                    version_response = requests.get(
+                        f"{WEAVIATE_CLUSTER_URL}/v1/meta",
+                        headers={"Authorization": f"Bearer {WEAVIATE_API_KEY}"}
+                    )
+                    if version_response.status_code == 200:
+                        version = version_response.json().get('version', 'unknown')
+                        logger.info(f"Weaviate server version: {version}")
+                    else:
+                        logger.warning(f"Failed to fetch Weaviate version: HTTP {version_response.status_code}, {version_response.text}")
+                except Exception as e:
+                    logger.error(f"Error fetching Weaviate version: {str(e)}", exc_info=True)
                 return weaviate_client
             else:
                 logger.warning("Weaviate client initialized but not ready")
@@ -67,8 +82,8 @@ def get_client():
         except Exception as e:
             logger.error(f"Weaviate client initialization attempt {attempt + 1} failed: {str(e)}", exc_info=True)
             time.sleep(2)
-    logger.error("Failed to initialize Weaviate client after 3 attempts")
-    raise EnvironmentError("Weaviate client initialization failed")
+    logger.error(f"Failed to initialize Weaviate client after 3 attempts. URL: {WEAVIATE_CLUSTER_URL}")
+    raise EnvironmentError(f"Weaviate client initialization failed. URL: {WEAVIATE_CLUSTER_URL}")
 
 try:
     with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
@@ -113,17 +128,13 @@ except Exception as e:
     logger.error(f"Failed to initialize NLTK WordNetLemmatizer: {str(e)}. Falling back to no lemmatization.")
 
 def strip_html(text):
-    return re.sub(r'<[^>]+>', '', text or '') if text else ''
-
-def preprocess_query(query):
-    if lemmatizer:
-        words = query.lower().split()
-        lemmatized = [lemmatizer.lemmatize(word, pos='n') for word in words]
-        processed = ' '.join(lemmatized)
-        logger.info(f"Processed query: {query} -> {processed}")
-        return processed
-    logger.warning(f"No lemmatizer available, using raw query: {query}")
-    return query.lower()
+    from bs4 import BeautifulSoup
+    try:
+        soup = BeautifulSoup(text, "html.parser")
+        return soup.get_text(separator=" ", strip=True)
+    except Exception as e:
+        logger.error(f"HTML stripping error: {str(e)}")
+        return text
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
 def get_embedding(text):
@@ -198,7 +209,8 @@ def search_content():
                 near_vector=vector,
                 limit=size * page + 10,
                 filters=filters,
-                return_metadata=["distance"]
+                return_metadata=["distance"],
+                return_properties=["content_id", "title", "description", "image"]
             )
         except Exception as e:
             logger.error(f"Weaviate query failed: {str(e)}", exc_info=True)
@@ -261,7 +273,8 @@ def rag_answer_content():
                 near_vector=vector,
                 limit=10,
                 filters=filters,
-                return_metadata=["distance"]
+                return_metadata=["distance"],
+                return_properties=["content_id", "text", "description"]
             )
         except Exception as e:
             logger.error(f"Weaviate query failed: {str(e)}", exc_info=True)
@@ -279,7 +292,7 @@ def rag_answer_content():
 
         for obj in matches:
             content_id = obj.properties.get("content_id", str(obj.uuid))
-            doc = strip_html(content_dict[content_type].get(content_id, obj.properties.get("description", "")))[:3000]
+            doc = strip_html(content_dict[content_type].get(content_id, obj.properties.get("text", obj.properties.get("description", ""))))[:3000]
             if not doc:
                 logger.warning(f"No content found for content_id={content_id}, content_type={content_type}")
                 continue
@@ -323,6 +336,16 @@ def rag_answer_content():
     finally:
         client.close()
         logger.info("Weaviate client closed after rag_answer_content")
+
+def preprocess_query(query):
+    if lemmatizer:
+        words = query.lower().split()
+        lemmatized = [lemmatizer.lemmatize(word, pos='n') for word in words]
+        processed = ' '.join(lemmatized)
+        logger.info(f"Processed query: {query} -> {processed}")
+        return processed
+    logger.warning(f"No lemmatizer available, using raw query: {query}")
+    return query.lower()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
