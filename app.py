@@ -46,7 +46,7 @@ if not all([OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY]):
 # Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Initialize Weaviate client for WCS
+# Initialize Weaviate client
 try:
     weaviate_client = weaviate.connect_to_wcs(
         cluster_url=WEAVIATE_CLUSTER_URL,
@@ -76,10 +76,12 @@ def strip_html(text):
 
 @app.route('/', methods=['GET', 'HEAD'])
 def health_check():
+    logger.info("Health check endpoint accessed")
     return jsonify({"status": "ok", "message": "AddictionTube Unified API is running"}), 200
 
 @app.errorhandler(429)
 def ratelimit_handler(e):
+    logger.warning(f"Rate limit exceeded: {e.description}")
     return jsonify({
         "error": "Rate limit exceeded",
         "details": f"Too many requests. Please wait and try again. Limit: {e.description}"
@@ -90,22 +92,15 @@ def ratelimit_handler(e):
 def search_content():
     query = re.sub(r'[^\w\s.,!?]', '', request.args.get('q', '')).strip()
     content_type = request.args.get('content_type', '').strip()
-    category = request.args.get('category', 'all').strip()
+    category = request.args.get('category', 'all').strip()  # Ignored, kept for compatibility
     page = max(1, int(request.args.get('page', 1)))
     size = max(1, min(100, int(request.args.get('per_page', 5))))
+
+    logger.info(f"Search request: query={query}, content_type={content_type}, category={category}, page={page}, per_page={size}")
 
     if not query or content_type not in ['songs', 'poems', 'stories']:
         logger.warning(f"Invalid request: query={query}, content_type={content_type}")
         return jsonify({"error": "Invalid or missing query or content type"}), 400
-
-    valid_categories = {
-        'songs': ['1074'],
-        'poems': ['1082'],
-        'stories': ['1028', '1042']
-    }
-    if category != 'all' and category not in valid_categories[content_type]:
-        logger.warning(f"Invalid category: {category} for content_type={content_type}")
-        return jsonify({"error": "Invalid category for selected content type"}), 400
 
     try:
         # Generate embedding for the query
@@ -115,10 +110,9 @@ def search_content():
         # Query Weaviate
         collection = weaviate_client.collections.get("Content")
         filters = None
-        if category != 'all':
-            from weaviate.classes.query import Filter
-            key = "category_id" if content_type in ['songs', 'poems'] else "category"
-            filters = Filter.by_property(key).equal(category)
+        # Filter by type instead of category
+        from weaviate.classes.query import Filter
+        filters = Filter.by_property("type").equal(content_type)
 
         results = collection.query.near_vector(
             near_vector=vector,
@@ -134,12 +128,13 @@ def search_content():
             item = {
                 "id": str(obj.uuid),
                 "score": obj.metadata.distance,
-                "title": strip_html(obj.properties.get("title", "")),
+                "title": strip_html(obj.properties.get("title", "N/A")),
                 "description": strip_html(obj.properties.get("description", "")),
-                "image": obj.properties.get("image", "")
+                "image": obj.properties.get("image", "") if content_type == 'stories' else ""
             }
             items.append(item)
 
+        logger.info(f"Search success: {len(items)} items returned, total={len(results.objects)}")
         return jsonify({"results": items, "total": len(results.objects)})
     except Exception as e:
         logger.error(f"Weaviate search error: {str(e)}")
@@ -150,21 +145,14 @@ def search_content():
 def rag_answer_content():
     query = re.sub(r'[^\w\s.,!?]', '', request.args.get('q', '')).strip()
     content_type = request.args.get('content_type', '').strip()
-    category = request.args.get('category', 'all').strip()
+    category = request.args.get('category', 'all').strip()  # Ignored, kept for compatibility
     reroll = request.args.get('reroll', '').lower().startswith('yes')
+
+    logger.info(f"RAG request: query={query}, content_type={content_type}, category={category}, reroll={reroll}")
 
     if not query or content_type not in ['songs', 'poems', 'stories']:
         logger.warning(f"Invalid RAG request: query={query}, content_type={content_type}")
         return jsonify({"error": "Invalid or missing query or content type"}), 400
-
-    valid_categories = {
-        'songs': ['1074'],
-        'poems': ['1082'],
-        'stories': ['1028', '1042']
-    }
-    if category != 'all' and category not in valid_categories[content_type]:
-        logger.warning(f"Invalid category: {category} for content_type={content_type}")
-        return jsonify({"error": "Invalid category for selected content type"}), 400
 
     try:
         # Generate embedding for the query
@@ -174,10 +162,9 @@ def rag_answer_content():
         # Query Weaviate
         collection = weaviate_client.collections.get("Content")
         filters = None
-        if category != 'all':
-            from weaviate.classes.query import Filter
-            key = "category_id" if content_type in ['songs', 'poems'] else "category"
-            filters = Filter.by_property(key).equal(category)
+        # Filter by type instead of category
+        from weaviate.classes.query import Filter
+        filters = Filter.by_property("type").equal(content_type)
 
         results = collection.query.near_vector(
             near_vector=vector,
@@ -193,9 +180,9 @@ def rag_answer_content():
         # Load content dictionary
         content_dict = {'songs': song_dict, 'poems': poem_dict, 'stories': story_dict}
         encoding = tiktoken.get_encoding("cl100k_base")
-        max_tokens = 16384 - 1000  # Reserve tokens for response
-        total_tokens = 0
+        max_tokens = 16384 - 1000
         context_docs = []
+        total_tokens = 0
 
         for obj in matches:
             doc = strip_html(content_dict[content_type].get(str(obj.uuid), obj.properties.get("description", "")))[:3000]
@@ -207,7 +194,7 @@ def rag_answer_content():
                 break
 
         if not context_docs:
-            logger.warning("No usable context data found for RAG")
+            logger.warning(f"No usable context data found for query={query}, content_type={content_type}")
             return jsonify({"error": "No usable context data found"}), 404
 
         # Generate RAG response
@@ -216,7 +203,7 @@ def rag_answer_content():
         user_prompt = f"""Use the following {content_type} to answer the question.\n\n{context_text}\n\nQuestion: {query}\nAnswer:"""
 
         response = client.chat.completions.create(
-            model="gpt-4o",  # Updated to a more recent model
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -224,6 +211,7 @@ def rag_answer_content():
             max_tokens=1000
         )
         answer = response.choices[0].message.content
+        logger.info(f"RAG success: Answer generated for query={query}, content_type={content_type}")
         return jsonify({"answer": answer})
     except Exception as e:
         logger.error(f"RAG failed: {str(e)}")
