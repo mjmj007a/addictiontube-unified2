@@ -13,18 +13,20 @@ from logging.handlers import RotatingFileHandler
 import tiktoken
 from dotenv import load_dotenv
 import random
+from nltk.stem import WordNetLemmatizer
+import nltk
+
+nltk.download('wordnet', quiet=True)
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://addictiontube.com", "http://addictiontube.com"]}})
 
-# Logging
 logger = logging.getLogger('addictiontube')
 logger.setLevel(logging.DEBUG)
 handler = RotatingFileHandler('unified_search.log', maxBytes=10485760, backupCount=5)
 handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
 logger.addHandler(handler)
 
-# Rate Limiting
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
@@ -33,7 +35,6 @@ limiter = Limiter(
     headers_enabled=True,
 )
 
-# Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEAVIATE_CLUSTER_URL = os.getenv("WEAVIATE_CLUSTER_URL")
@@ -43,10 +44,8 @@ if not all([OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY]):
     logger.error("Missing one or more required environment variables.")
     raise EnvironmentError("Missing one or more required environment variables.")
 
-# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Initialize Weaviate client
 try:
     weaviate_client = weaviate.connect_to_wcs(
         cluster_url=WEAVIATE_CLUSTER_URL,
@@ -58,7 +57,6 @@ except Exception as e:
     logger.error(f"Failed to initialize Weaviate client: {str(e)}")
     raise
 
-# Load content dictionaries
 try:
     with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
         song_dict = {item['video_id']: item['song'] for item in json.load(f)}
@@ -71,8 +69,13 @@ except Exception as e:
     raise
 
 def strip_html(text):
-    """Remove HTML tags from text."""
     return re.sub(r'<[^>]+>', '', text or '') if text else ''
+
+def preprocess_query(query):
+    lemmatizer = WordNetLemmatizer()
+    words = query.lower().split()
+    lemmatized = [lemmatizer.lemmatize(word, pos='n') for word in words]
+    return ' '.join(lemmatized)
 
 @app.route('/', methods=['GET', 'HEAD'])
 def health_check():
@@ -92,7 +95,7 @@ def ratelimit_handler(e):
 def search_content():
     query = re.sub(r'[^\w\s.,!?]', '', request.args.get('q', '')).strip()
     content_type = request.args.get('content_type', '').strip()
-    category = request.args.get('category', 'all').strip()  # Ignored, kept for compatibility
+    category = request.args.get('category', 'all').strip()  # Ignored
     page = max(1, int(request.args.get('page', 1)))
     size = max(1, min(100, int(request.args.get('per_page', 5))))
 
@@ -103,30 +106,28 @@ def search_content():
         return jsonify({"error": "Invalid or missing query or content type"}), 400
 
     try:
-        # Generate embedding for the query
-        embedding = client.embeddings.create(input=query, model="text-embedding-3-small")
+        processed_query = preprocess_query(query)
+        logger.info(f"Processed query: {processed_query}")
+        embedding = client.embeddings.create(input=processed_query, model="text-embedding-3-small")
         vector = embedding.data[0].embedding
 
-        # Query Weaviate
         collection = weaviate_client.collections.get("Content")
         filters = None
-        # Filter by type instead of category
         from weaviate.classes.query import Filter
         filters = Filter.by_property("type").equal(content_type)
 
         results = collection.query.near_vector(
             near_vector=vector,
-            limit=size * page,
+            limit=size * page + 10,
             filters=filters,
             return_metadata=["distance"]
         )
 
-        # Paginate results
         paginated = results.objects[(page - 1) * size: page * size]
         items = []
         for obj in paginated:
             item = {
-                "id": str(obj.uuid),
+                "id": obj.properties.get("content_id", str(obj.uuid)),  # Use content_id, fallback to UUID
                 "score": obj.metadata.distance,
                 "title": strip_html(obj.properties.get("title", "N/A")),
                 "description": strip_html(obj.properties.get("description", "")),
@@ -145,7 +146,7 @@ def search_content():
 def rag_answer_content():
     query = re.sub(r'[^\w\s.,!?]', '', request.args.get('q', '')).strip()
     content_type = request.args.get('content_type', '').strip()
-    category = request.args.get('category', 'all').strip()  # Ignored, kept for compatibility
+    category = request.args.get('category', 'all').strip()  # Ignored
     reroll = request.args.get('reroll', '').lower().startswith('yes')
 
     logger.info(f"RAG request: query={query}, content_type={content_type}, category={category}, reroll={reroll}")
@@ -155,20 +156,19 @@ def rag_answer_content():
         return jsonify({"error": "Invalid or missing query or content type"}), 400
 
     try:
-        # Generate embedding for the query
-        embedding = client.embeddings.create(input=query, model="text-embedding-3-small")
+        processed_query = preprocess_query(query)
+        logger.info(f"Processed RAG query: {processed_query}")
+        embedding = client.embeddings.create(input=processed_query, model="text-embedding-3-small")
         vector = embedding.data[0].embedding
 
-        # Query Weaviate
         collection = weaviate_client.collections.get("Content")
         filters = None
-        # Filter by type instead of category
         from weaviate.classes.query import Filter
         filters = Filter.by_property("type").equal(content_type)
 
         results = collection.query.near_vector(
             near_vector=vector,
-            limit=5,
+            limit=10,
             filters=filters,
             return_metadata=["distance"]
         )
@@ -177,7 +177,6 @@ def rag_answer_content():
         if reroll:
             random.shuffle(matches)
 
-        # Load content dictionary
         content_dict = {'songs': song_dict, 'poems': poem_dict, 'stories': story_dict}
         encoding = tiktoken.get_encoding("cl100k_base")
         max_tokens = 16384 - 1000
@@ -185,7 +184,7 @@ def rag_answer_content():
         total_tokens = 0
 
         for obj in matches:
-            doc = strip_html(content_dict[content_type].get(str(obj.uuid), obj.properties.get("description", "")))[:3000]
+            doc = strip_html(content_dict[content_type].get(obj.properties.get("content_id", str(obj.uuid)), obj.properties.get("description", "")))[:3000]
             token_len = len(encoding.encode(doc))
             if total_tokens + token_len <= max_tokens:
                 context_docs.append(doc)
@@ -197,7 +196,6 @@ def rag_answer_content():
             logger.warning(f"No usable context data found for query={query}, content_type={content_type}")
             return jsonify({"error": "No usable context data found"}), 404
 
-        # Generate RAG response
         context_text = "\n\n---\n\n".join(context_docs)
         system_prompt = f"You are an expert assistant for addiction recovery {content_type}."
         user_prompt = f"""Use the following {content_type} to answer the question.\n\n{context_text}\n\nQuestion: {query}\nAnswer:"""
