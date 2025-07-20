@@ -78,6 +78,27 @@ try:
     with open('stories.json', 'r', encoding='utf-8') as f:
         story_dict = {item['id']: item['text'] for item in json.load(f)}
     logger.info(f"Loaded dictionaries: songs={len(song_dict)}, poems={len(poem_dict)}, stories={len(story_dict)}")
+
+    # Validate JSON files against song-locations.json and video_locations.json
+    try:
+        with open('song-locations.json', 'r', encoding='utf-8') as f:
+            song_locations = json.load(f)
+            song_location_ids = set(item['video_id'] for item in song_locations)
+            logger.info(f"Song location IDs: {len(song_location_ids)}, sample: {list(song_location_ids)[:5]}")
+            logger.info(f"Song dict IDs: {len(song_dict)}, sample: {list(song_dict.keys())[:5]}")
+            mismatches = song_location_ids - set(song_dict.keys())
+            if mismatches:
+                logger.warning(f"Song ID mismatches: {mismatches}")
+        with open('video_locations.json', 'r', encoding='utf-8') as f:
+            poem_locations = json.load(f)
+            poem_location_ids = set(item['video_id'] for item in poem_locations)
+            logger.info(f"Poem location IDs: {len(poem_location_ids)}, sample: {list(poem_location_ids)[:5]}")
+            logger.info(f"Poem dict IDs: {len(poem_dict)}, sample: {list(poem_dict.keys())[:5]}")
+            mismatches = poem_location_ids - set(poem_dict.keys())
+            if mismatches:
+                logger.warning(f"Poem ID mismatches: {mismatches}")
+    except Exception as e:
+        logger.error(f"Failed to validate JSON files: {str(e)}", exc_info=True)
 except Exception as e:
     logger.error(f"Failed to load content dictionaries: {str(e)}", exc_info=True)
     raise
@@ -126,6 +147,9 @@ def health_check():
             return jsonify({"error": "OpenAI health check failed", "details": str(e)}), 503
         collections = client.collections.list_all()
         logger.info(f"Weaviate collections: {collections}")
+        if 'Content' not in collections:
+            logger.error("Content collection not found in Weaviate")
+            return jsonify({"error": "Content collection not found", "details": "Weaviate schema missing Content collection"}), 503
         return jsonify({"status": "ok", "message": "AddictionTube Unified API is running", "weaviate_collections": list(collections.keys())}), 200
     except Exception as e:
         logger.error(f"Weaviate health check failed: {str(e)}", exc_info=True)
