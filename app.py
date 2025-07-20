@@ -14,6 +14,7 @@ import tiktoken
 from dotenv import load_dotenv
 import random
 import nltk
+import time
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -46,20 +47,31 @@ if not all([OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY]):
     raise EnvironmentError("Missing one or more required environment variables.")
 
 # Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Initialize Weaviate client
 try:
-    weaviate_client = weaviate.connect_to_wcs(
-        cluster_url=WEAVIATE_CLUSTER_URL,
-        auth_credentials=AuthApiKey(WEAVIATE_API_KEY),
-        headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
-        skip_init_checks=True
-    )
-    logger.info("Weaviate client initialized successfully")
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    logger.info("OpenAI client initialized successfully")
 except Exception as e:
-    logger.error(f"Failed to initialize Weaviate client: {str(e)}")
+    logger.error(f"Failed to initialize OpenAI client: {str(e)}")
     raise
+
+# Initialize Weaviate client with retry
+weaviate_client = None
+for attempt in range(3):
+    try:
+        weaviate_client = weaviate.connect_to_wcs(
+            cluster_url=WEAVIATE_CLUSTER_URL,
+            auth_credentials=AuthApiKey(WEAVIATE_API_KEY),
+            headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
+            skip_init_checks=True
+        )
+        logger.info("Weaviate client initialized successfully")
+        break
+    except Exception as e:
+        logger.error(f"Weaviate client initialization attempt {attempt + 1} failed: {str(e)}")
+        time.sleep(2)
+if weaviate_client is None:
+    logger.error("Failed to initialize Weaviate client after 3 attempts")
+    raise EnvironmentError("Weaviate client initialization failed")
 
 # Load content dictionaries
 try:
@@ -77,7 +89,7 @@ except Exception as e:
 # Initialize NLTK lemmatizer
 lemmatizer = None
 try:
-    nltk.download('wordnet', quiet=True)
+    nltk.download('wordnet', quiet=True, raise_on_error=True)
     from nltk.stem import WordNetLemmatizer
     lemmatizer = WordNetLemmatizer()
     logger.info("NLTK WordNetLemmatizer initialized successfully")
@@ -126,6 +138,7 @@ def search_content():
         return jsonify({"error": "Invalid or missing query or content type"}), 400
 
     try:
+        start_time = time.time()
         processed_query = preprocess_query(query)
         embedding = client.embeddings.create(input=processed_query, model="text-embedding-3-small")
         vector = embedding.data[0].embedding
@@ -153,7 +166,7 @@ def search_content():
             }
             items.append(item)
 
-        logger.info(f"Search success: {len(items)} items returned, total={len(results.objects)}")
+        logger.info(f"Search success: {len(items)} items returned, total={len(results.objects)}, time={time.time() - start_time:.2f}s")
         return jsonify({"results": items, "total": len(results.objects)})
     except Exception as e:
         logger.error(f"Weaviate search error: {str(e)}")
@@ -174,6 +187,7 @@ def rag_answer_content():
         return jsonify({"error": "Invalid or missing query or content type"}), 400
 
     try:
+        start_time = time.time()
         processed_query = preprocess_query(query)
         embedding = client.embeddings.create(input=processed_query, model="text-embedding-3-small")
         vector = embedding.data[0].embedding
@@ -225,7 +239,7 @@ def rag_answer_content():
             max_tokens=1000
         )
         answer = response.choices[0].message.content
-        logger.info(f"RAG success: Answer generated for query={query}, content_type={content_type}")
+        logger.info(f"RAG success: Answer generated for query={query}, content_type={content_type}, time={time.time() - start_time:.2f}s")
         return jsonify({"answer": answer})
     except Exception as e:
         logger.error(f"RAG failed: {str(e)}")
