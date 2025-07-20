@@ -13,20 +13,20 @@ from logging.handlers import RotatingFileHandler
 import tiktoken
 from dotenv import load_dotenv
 import random
-from nltk.stem import WordNetLemmatizer
 import nltk
 
-nltk.download('wordnet', quiet=True)
-
+# Initialize Flask app
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://addictiontube.com", "http://addictiontube.com"]}})
 
+# Logging
 logger = logging.getLogger('addictiontube')
 logger.setLevel(logging.DEBUG)
 handler = RotatingFileHandler('unified_search.log', maxBytes=10485760, backupCount=5)
 handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
 logger.addHandler(handler)
 
+# Rate Limiting
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
@@ -35,6 +35,7 @@ limiter = Limiter(
     headers_enabled=True,
 )
 
+# Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEAVIATE_CLUSTER_URL = os.getenv("WEAVIATE_CLUSTER_URL")
@@ -44,8 +45,10 @@ if not all([OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY]):
     logger.error("Missing one or more required environment variables.")
     raise EnvironmentError("Missing one or more required environment variables.")
 
+# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Initialize Weaviate client
 try:
     weaviate_client = weaviate.connect_to_wcs(
         cluster_url=WEAVIATE_CLUSTER_URL,
@@ -53,10 +56,12 @@ try:
         headers={"X-OpenAI-Api-Key": OPENAI_API_KEY},
         skip_init_checks=True
     )
+    logger.info("Weaviate client initialized successfully")
 except Exception as e:
     logger.error(f"Failed to initialize Weaviate client: {str(e)}")
     raise
 
+# Load content dictionaries
 try:
     with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
         song_dict = {item['video_id']: item['song'] for item in json.load(f)}
@@ -64,18 +69,33 @@ try:
         poem_dict = {item['video_id']: item['poem'] for item in json.load(f)}
     with open('stories.json', 'r', encoding='utf-8') as f:
         story_dict = {item['id']: item['text'] for item in json.load(f)}
+    logger.info("Content dictionaries loaded successfully")
 except Exception as e:
     logger.error(f"Failed to load content dictionaries: {str(e)}")
     raise
+
+# Initialize NLTK lemmatizer
+lemmatizer = None
+try:
+    nltk.download('wordnet', quiet=True)
+    from nltk.stem import WordNetLemmatizer
+    lemmatizer = WordNetLemmatizer()
+    logger.info("NLTK WordNetLemmatizer initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize NLTK WordNetLemmatizer: {str(e)}. Falling back to no lemmatization.")
 
 def strip_html(text):
     return re.sub(r'<[^>]+>', '', text or '') if text else ''
 
 def preprocess_query(query):
-    lemmatizer = WordNetLemmatizer()
-    words = query.lower().split()
-    lemmatized = [lemmatizer.lemmatize(word, pos='n') for word in words]
-    return ' '.join(lemmatized)
+    if lemmatizer:
+        words = query.lower().split()
+        lemmatized = [lemmatizer.lemmatize(word, pos='n') for word in words]
+        processed = ' '.join(lemmatized)
+        logger.info(f"Processed query: {query} -> {processed}")
+        return processed
+    logger.warning(f"No lemmatizer available, using raw query: {query}")
+    return query.lower()
 
 @app.route('/', methods=['GET', 'HEAD'])
 def health_check():
@@ -107,12 +127,10 @@ def search_content():
 
     try:
         processed_query = preprocess_query(query)
-        logger.info(f"Processed query: {processed_query}")
         embedding = client.embeddings.create(input=processed_query, model="text-embedding-3-small")
         vector = embedding.data[0].embedding
 
         collection = weaviate_client.collections.get("Content")
-        filters = None
         from weaviate.classes.query import Filter
         filters = Filter.by_property("type").equal(content_type)
 
@@ -127,7 +145,7 @@ def search_content():
         items = []
         for obj in paginated:
             item = {
-                "id": obj.properties.get("content_id", str(obj.uuid)),  # Use content_id, fallback to UUID
+                "id": obj.properties.get("content_id", str(obj.uuid)),
                 "score": obj.metadata.distance,
                 "title": strip_html(obj.properties.get("title", "N/A")),
                 "description": strip_html(obj.properties.get("description", "")),
@@ -139,7 +157,7 @@ def search_content():
         return jsonify({"results": items, "total": len(results.objects)})
     except Exception as e:
         logger.error(f"Weaviate search error: {str(e)}")
-        return jsonify({"error": "Search failed", "details": str(e)}), 500
+        return jsonify({"error": "Search failed", "details": str(e)}), 502
 
 @app.route('/rag_answer_content', methods=['GET'])
 @limiter.limit("30 per hour")
@@ -157,12 +175,10 @@ def rag_answer_content():
 
     try:
         processed_query = preprocess_query(query)
-        logger.info(f"Processed RAG query: {processed_query}")
         embedding = client.embeddings.create(input=processed_query, model="text-embedding-3-small")
         vector = embedding.data[0].embedding
 
         collection = weaviate_client.collections.get("Content")
-        filters = None
         from weaviate.classes.query import Filter
         filters = Filter.by_property("type").equal(content_type)
 
@@ -213,7 +229,7 @@ def rag_answer_content():
         return jsonify({"answer": answer})
     except Exception as e:
         logger.error(f"RAG failed: {str(e)}")
-        return jsonify({"error": "RAG processing failed", "details": str(e)}), 500
+        return jsonify({"error": "RAG processing failed", "details": str(e)}), 502
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
