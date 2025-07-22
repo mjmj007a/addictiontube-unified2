@@ -11,22 +11,23 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import tiktoken
-from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 import random
+from dotenv import load_dotenv
 import nltk
-import time
 from tenacity import retry, stop_after_attempt, wait_exponential
-import requests
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ["https://addictiontube.com", "http://addictiontube.com"]}})
 
+# Configure logging
 logger = logging.getLogger('addictiontube')
 logger.setLevel(logging.DEBUG)
 handler = RotatingFileHandler('/tmp/unified_search.log', maxBytes=10485760, backupCount=5)
 handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
 logger.addHandler(handler)
 
+# Initialize Flask-Limiter
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
@@ -35,23 +36,29 @@ limiter = Limiter(
     headers_enabled=True,
 )
 
+# Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEAVIATE_CLUSTER_URL = os.getenv("WEAVIATE_CLUSTER_URL")
 WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
 
-if not all([OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY]):
-    logger.error("Missing one or more required environment variables: OPENAI_API_KEY, WEAVIATE_CLUSTER_URL, WEAVIATE_API_KEY")
-    raise EnvironmentError("Missing one or more required environment variables")
+# Validate environment variables
+missing_vars = []
+if not OPENAI_API_KEY:
+    missing_vars.append("OPENAI_API_KEY")
+if not WEAVIATE_CLUSTER_URL:
+    missing_vars.append("WEAVIATE_CLUSTER_URL")
+if not WEAVIATE_API_KEY:
+    missing_vars.append("WEAVIATE_API_KEY")
+if missing_vars:
+    error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
+    logger.error(error_msg)
+    raise EnvironmentError(error_msg)
 
-try:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    logger.info("OpenAI client initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize OpenAI client: {str(e)}", exc_info=True)
-    raise
+# Initialize clients
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-def get_client():
+def get_weaviate_client():
     for attempt in range(3):
         try:
             weaviate_client = weaviate.connect_to_weaviate_cloud(
@@ -62,63 +69,24 @@ def get_client():
             )
             if weaviate_client.is_ready():
                 logger.info("Weaviate client initialized and ready")
-                # Log Weaviate server version
-                try:
-                    version_response = requests.get(
-                        f"{WEAVIATE_CLUSTER_URL}/v1/meta",
-                        headers={"Authorization": f"Bearer {WEAVIATE_API_KEY}"}
-                    )
-                    if version_response.status_code == 200:
-                        version = version_response.json().get('version', 'unknown')
-                        logger.info(f"Weaviate server version: {version}")
-                    else:
-                        logger.warning(f"Failed to fetch Weaviate version: HTTP {version_response.status_code}, {version_response.text}")
-                except Exception as e:
-                    logger.error(f"Error fetching Weaviate version: {str(e)}", exc_info=True)
                 return weaviate_client
             else:
                 logger.warning("Weaviate client initialized but not ready")
                 weaviate_client.close()
         except Exception as e:
-            logger.error(f"Weaviate client initialization attempt {attempt + 1} failed: {str(e)}", exc_info=True)
-            time.sleep(2)
-    logger.error(f"Failed to initialize Weaviate client after 3 attempts. URL: {WEAVIATE_CLUSTER_URL}")
-    raise EnvironmentError(f"Weaviate client initialization failed. URL: {WEAVIATE_CLUSTER_URL}")
+            logger.error(f"Weaviate client initialization attempt {attempt + 1} failed: {str(e)}")
+    logger.error("Failed to initialize Weaviate client after 3 attempts")
+    raise EnvironmentError("Weaviate client initialization failed")
 
-try:
-    with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
-        song_dict = {item['video_id']: item['song'] for item in json.load(f)}
-    with open('videos_revised_with_poems-july04.json', 'r', encoding='utf-8') as f:
-        poem_dict = {item['video_id']: item['poem'] for item in json.load(f)}
-    with open('stories.json', 'r', encoding='utf-8') as f:
-        story_dict = {item['id']: item['text'] for item in json.load(f)}
-    logger.info(f"Loaded dictionaries: songs={len(song_dict)}, poems={len(poem_dict)}, stories={len(story_dict)}")
+# Load metadata
+with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
+    song_dict = {item['video_id']: item['song'] for item in json.load(f)}
+with open('videos_revised_with_poems-july04.json', 'r', encoding='utf-8') as f:
+    poem_dict = {item['video_id']: item['poem'] for item in json.load(f)}
+with open('stories.json', 'r', encoding='utf-8') as f:
+    story_dict = {item['id']: item['text'] for item in json.load(f)}
 
-    # Validate JSON files against song-locations.json and video_locations.json
-    try:
-        with open('song-locations.json', 'r', encoding='utf-8') as f:
-            song_locations = json.load(f)
-            song_location_ids = set(item['video_id'] for item in song_locations)
-            logger.info(f"Song location IDs: {len(song_location_ids)}, sample: {list(song_location_ids)[:5]}")
-            logger.info(f"Song dict IDs: {len(song_dict)}, sample: {list(song_dict.keys())[:5]}")
-            mismatches = song_location_ids - set(song_dict.keys())
-            if mismatches:
-                logger.warning(f"Song ID mismatches: {mismatches}")
-        with open('video_locations.json', 'r', encoding='utf-8') as f:
-            poem_locations = json.load(f)
-            poem_location_ids = set(item['video_id'] for item in poem_locations)
-            logger.info(f"Poem location IDs: {len(poem_location_ids)}, sample: {list(poem_location_ids)[:5]}")
-            logger.info(f"Poem dict IDs: {len(poem_dict)}, sample: {list(poem_dict.keys())[:5]}")
-            mismatches = poem_location_ids - set(poem_dict.keys())
-            if mismatches:
-                logger.warning(f"Poem ID mismatches: {mismatches}")
-    except Exception as e:
-        logger.error(f"Failed to validate JSON files: {str(e)}", exc_info=True)
-except Exception as e:
-    logger.error(f"Failed to load content dictionaries: {str(e)}", exc_info=True)
-    raise
-
-lemmatizer = None
+# Initialize NLTK lemmatizer
 try:
     nltk.download('wordnet', quiet=True, raise_on_error=True)
     from nltk.stem import WordNetLemmatizer
@@ -126,52 +94,57 @@ try:
     logger.info("NLTK WordNetLemmatizer initialized successfully")
 except Exception as e:
     logger.error(f"Failed to initialize NLTK WordNetLemmatizer: {str(e)}. Falling back to no lemmatization.")
+    lemmatizer = None
 
 def strip_html(text):
-    from bs4 import BeautifulSoup
     try:
         soup = BeautifulSoup(text, "html.parser")
         return soup.get_text(separator=" ", strip=True)
     except Exception as e:
         logger.error(f"HTML stripping error: {str(e)}")
-        return text
+        return text or ''
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
 def get_embedding(text):
-    response = client.embeddings.create(input=text, model="text-embedding-3-small")
-    logger.info(f"OpenAI embedding headers: {response.headers}")
-    return response.data[0].embedding
+    try:
+        response = client.embeddings.create(input=text, model="text-embedding-3-small")
+        return response.data[0].embedding
+    except APIError as e:
+        logger.error(f"OpenAI embedding failed: {str(e)}")
+        raise
+
+def preprocess_query(query):
+    if lemmatizer:
+        words = query.lower().split()
+        lemmatized = [lemmatizer.lemmatize(word, pos='n') for word in words]
+        processed = ' '.join(lemmatized)
+        logger.info(f"Processed query: {query} -> {processed}")
+        return processed
+    logger.warning(f"No lemmatizer available, using raw query: {query}")
+    return query.lower()
 
 @app.route('/', methods=['GET', 'HEAD'])
 def health_check():
     logger.info("Health check endpoint accessed")
-    client = get_client()
+    weaviate_client = get_weaviate_client()
     try:
-        if not client.is_ready():
-            logger.warning("Weaviate client not ready")
-            return jsonify({"error": "Weaviate client not ready", "details": "Client initialized but not ready"}), 503
+        if not weaviate_client.is_ready():
+            return jsonify({"error": "Weaviate client not ready"}), 503
+        collections = weaviate_client.collections.list_all()
+        if 'Content' not in collections:
+            return jsonify({"error": "Content collection not found"}), 503
         try:
             embedding = get_embedding("test")
             logger.info("OpenAI embedding test successful")
         except APIError as e:
-            logger.error(f"OpenAI health check failed: {str(e)}", exc_info=True)
             return jsonify({"error": "OpenAI health check failed", "details": str(e)}), 503
-        collections = client.collections.list_all()
-        logger.info(f"Weaviate collections: {collections}")
-        if 'Content' not in collections:
-            logger.error("Content collection not found in Weaviate")
-            return jsonify({"error": "Content collection not found", "details": "Weaviate schema missing Content collection"}), 503
-        return jsonify({"status": "ok", "message": "AddictionTube Unified API is running", "weaviate_collections": list(collections.keys())}), 200
-    except Exception as e:
-        logger.error(f"Weaviate health check failed: {str(e)}", exc_info=True)
-        return jsonify({"error": "Weaviate health check failed", "details": str(e)}), 503
+        return jsonify({"status": "ok", "message": "AddictionTube Unified API is running"}), 200
     finally:
-        client.close()
-        logger.info("Weaviate client closed after health check")
+        weaviate_client.close()
 
 @app.errorhandler(429)
 def ratelimit_handler(e):
-    logger.warning(f"Rate limit exceeded: {e.description}, remote_addr={get_remote_address()}")
+    logger.warning(f"Rate limit exceeded: {e.description}")
     return jsonify({
         "error": "Rate limit exceeded",
         "details": f"Too many requests. Please wait and try again. Limit: {e.description}"
@@ -185,62 +158,54 @@ def search_content():
     page = max(1, int(request.args.get('page', 1)))
     size = max(1, min(100, int(request.args.get('per_page', 5))))
 
-    logger.info(f"Search request: query={query}, content_type={content_type}, page={page}, per_page={size}")
-
-    if not query or content_type not in ['songs', 'poems', 'stories']:
-        logger.warning(f"Invalid request: query={query}, content_type={content_type}")
+    if not query or not content_type or content_type not in ['songs', 'poems', 'stories']:
+        logger.error(f"Invalid request: query='{query}', content_type='{content_type}'")
         return jsonify({"error": "Invalid or missing query or content type"}), 400
 
-    client = get_client()
+    weaviate_client = get_weaviate_client()
     try:
-        start_time = time.time()
         processed_query = preprocess_query(query)
         try:
             vector = get_embedding(processed_query)
         except APIError as e:
-            logger.error(f"OpenAI embedding failed: {str(e)}", exc_info=True)
-            return jsonify({"error": "Embedding generation failed", "details": str(e)}), 500
+            logger.error(f"OpenAI embedding failed: {str(e)}")
+            return jsonify({"error": "Embedding service unavailable", "details": str(e)}), 500
 
         try:
-            collection = client.collections.get("Content")
+            collection = weaviate_client.collections.get("Content")
             from weaviate.classes.query import Filter
             filters = Filter.by_property("type").equal(content_type)
             results = collection.query.near_vector(
                 near_vector=vector,
-                limit=size * page + 10,
+                limit=size * page,
                 filters=filters,
                 return_metadata=["distance"],
-                return_properties=["content_id", "title", "description", "image"]
+                return_properties=["content_id", "title", "description", "image", "url"]
             )
+            total = len(results.objects)
+            paginated = results.objects[(page - 1) * size:page * size]
+
+            items = []
+            for obj in paginated:
+                item = {
+                    "content_id": obj.properties.get("content_id", str(obj.uuid)),
+                    "score": obj.metadata.distance,
+                    "title": strip_html(obj.properties.get("title", "N/A")),
+                    "description": strip_html(obj.properties.get("description", ""))
+                }
+                if content_type == 'stories':
+                    item['image'] = obj.properties.get("image", "")
+                elif content_type in ['songs', 'poems']:
+                    item['url'] = obj.properties.get("url", "")
+                items.append(item)
+
+            logger.info(f"Search completed: query='{query}', content_type='{content_type}', page={page}, total={total}")
+            return jsonify({"results": items, "total": total})
         except Exception as e:
-            logger.error(f"Weaviate query failed: {str(e)}", exc_info=True)
-            return jsonify({"error": "Weaviate query failed", "details": str(e)}), 500
-
-        content_dict = {'songs': song_dict, 'poems': poem_dict, 'stories': story_dict}
-        paginated = results.objects[(page - 1) * size:page * size]
-        items = []
-        for obj in paginated:
-            content_id = obj.properties.get("content_id", str(obj.uuid))
-            if content_id not in content_dict.get(content_type, {}):
-                logger.warning(f"Content ID {content_id} not found in {content_type} dictionary")
-            item = {
-                "id": content_id,
-                "score": obj.metadata.distance,
-                "title": strip_html(obj.properties.get("title", "N/A")),
-                "description": strip_html(obj.properties.get("description", "")),
-                "image": obj.properties.get("image", "") if content_type == 'stories' else ""
-            }
-            items.append(item)
-
-        response = {"results": items, "total": len(results.objects)}
-        logger.info(f"Search success: {len(items)} items returned, total={len(results.objects)}, time={time.time() - start_time:.2f}s")
-        return jsonify(response)
-    except Exception as e:
-        logger.error(f"Unexpected error in search_content: {str(e)}", exc_info=True)
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+            logger.error(f"Weaviate query failed for {content_type}: {str(e)}")
+            return jsonify({"error": "Search service unavailable", "details": str(e)}), 500
     finally:
-        client.close()
-        logger.info("Weaviate client closed after search_content")
+        weaviate_client.close()
 
 @app.route('/rag_answer_content', methods=['GET'])
 @limiter.limit("30 per hour")
@@ -249,66 +214,63 @@ def rag_answer_content():
     content_type = request.args.get('content_type', '').strip()
     reroll = request.args.get('reroll', '').lower().startswith('yes')
 
-    logger.info(f"RAG request: query={query}, content_type={content_type}, reroll={reroll}")
-
-    if not query or content_type not in ['songs', 'poems', 'stories']:
-        logger.warning(f"Invalid RAG request: query={query}, content_type={content_type}")
+    if not query or not content_type or content_type not in ['songs', 'poems', 'stories']:
+        logger.error(f"Invalid RAG request: query='{query}', content_type='{content_type}'")
         return jsonify({"error": "Invalid or missing query or content type"}), 400
 
-    client = get_client()
+    weaviate_client = get_weaviate_client()
     try:
-        start_time = time.time()
         processed_query = preprocess_query(query)
         try:
             vector = get_embedding(processed_query)
         except APIError as e:
-            logger.error(f"OpenAI embedding failed: {str(e)}", exc_info=True)
-            return jsonify({"error": "Embedding generation failed", "details": str(e)}), 500
+            logger.error(f"OpenAI embedding failed: {str(e)}")
+            return jsonify({"error": "Embedding service unavailable", "details": str(e)}), 500
 
         try:
-            collection = client.collections.get("Content")
+            collection = weaviate_client.collections.get("Content")
             from weaviate.classes.query import Filter
             filters = Filter.by_property("type").equal(content_type)
             results = collection.query.near_vector(
                 near_vector=vector,
-                limit=10,
+                limit=5,
                 filters=filters,
                 return_metadata=["distance"],
                 return_properties=["content_id", "text", "description"]
             )
         except Exception as e:
-            logger.error(f"Weaviate query failed: {str(e)}", exc_info=True)
+            logger.error(f"Weaviate query failed: {str(e)}")
             return jsonify({"error": "Weaviate query failed", "details": str(e)}), 500
 
         matches = results.objects
         if reroll:
             random.shuffle(matches)
 
-        content_dict = {'songs': song_dict, 'poems': poem_dict, 'stories': story_dict}
+        if not matches:
+            logger.warning(f"No matches found for query='{query}', content_type='{content_type}'")
+            return jsonify({"error": "No relevant context found"}), 404
+
         encoding = tiktoken.get_encoding("cl100k_base")
         max_tokens = 16384 - 1000
         context_docs = []
         total_tokens = 0
+        content_dict = {'songs': song_dict, 'poems': poem_dict, 'stories': story_dict}
 
-        for obj in matches:
-            content_id = obj.properties.get("content_id", str(obj.uuid))
-            doc = strip_html(content_dict[content_type].get(content_id, obj.properties.get("text", obj.properties.get("description", ""))))[:3000]
-            if not doc:
-                logger.warning(f"No content found for content_id={content_id}, content_type={content_type}")
+        for match in matches:
+            text = content_dict[content_type].get(match.properties.get("content_id", ""), match.properties.get("text", match.properties.get("description", "")))
+            if not text:
+                logger.warning(f"Match {match.properties.get('content_id')} has no text metadata in {content_type}")
                 continue
-            try:
-                token_len = len(encoding.encode(doc))
-                if total_tokens + token_len <= max_tokens:
-                    context_docs.append(doc)
-                    total_tokens += token_len
-                else:
-                    break
-            except Exception as e:
-                logger.error(f"Token encoding failed for content_id={content_id}: {str(e)}", exc_info=True)
-                continue
+            doc = strip_html(text)[:3000]
+            doc_tokens = len(encoding.encode(doc))
+            if total_tokens + doc_tokens <= max_tokens:
+                context_docs.append(doc)
+                total_tokens += doc_tokens
+            else:
+                break
 
         if not context_docs:
-            logger.warning(f"No usable context data found for query={query}, content_type={content_type}")
+            logger.warning(f"No usable context data for query='{query}', content_type='{content_type}'")
             return jsonify({"error": "No usable context data found"}), 404
 
         context_text = "\n\n---\n\n".join(context_docs)
@@ -325,28 +287,14 @@ def rag_answer_content():
                 max_tokens=1000
             )
             answer = response.choices[0].message.content
-            logger.info(f"RAG success: Answer generated for query={query}, content_type={content_type}, time={time.time() - start_time:.2f}s")
+            logger.info(f"RAG answer generated for query='{query}', content_type='{content_type}'")
             return jsonify({"answer": answer})
         except APIError as e:
-            logger.error(f"OpenAI completion failed: {str(e)}", exc_info=True)
-            return jsonify({"error": "RAG answer generation failed", "details": str(e)}), 500
-    except Exception as e:
-        logger.error(f"Unexpected error in rag_answer_content: {str(e)}", exc_info=True)
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+            logger.error(f"OpenAI completion failed: {str(e)}")
+            return jsonify({"error": "RAG processing failed", "details": str(e)}), 500
     finally:
-        client.close()
-        logger.info("Weaviate client closed after rag_answer_content")
-
-def preprocess_query(query):
-    if lemmatizer:
-        words = query.lower().split()
-        lemmatized = [lemmatizer.lemmatize(word, pos='n') for word in words]
-        processed = ' '.join(lemmatized)
-        logger.info(f"Processed query: {query} -> {processed}")
-        return processed
-    logger.warning(f"No lemmatizer available, using raw query: {query}")
-    return query.lower()
+        weaviate_client.close()
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
