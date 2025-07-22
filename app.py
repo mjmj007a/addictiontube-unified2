@@ -79,12 +79,17 @@ def get_weaviate_client():
     raise EnvironmentError("Weaviate client initialization failed")
 
 # Load metadata
-with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
-    song_dict = {item['video_id']: item['song'] for item in json.load(f)}
-with open('videos_revised_with_poems-july04.json', 'r', encoding='utf-8') as f:
-    poem_dict = {item['video_id']: item['poem'] for item in json.load(f)}
-with open('stories.json', 'r', encoding='utf-8') as f:
-    story_dict = {item['id']: item['text'] for item in json.load(f)}
+try:
+    with open('songs_revised_with_songs-july06.json', 'r', encoding='utf-8') as f:
+        song_dict = {item['video_id']: item['song'] for item in json.load(f)}
+    with open('videos_revised_with_poems-july04.json', 'r', encoding='utf-8') as f:
+        poem_dict = {item['video_id']: item['poem'] for item in json.load(f)}
+    with open('stories.json', 'r', encoding='utf-8') as f:
+        story_dict = {item['id']: item['text'] for item in json.load(f)}
+    logger.info("Metadata JSON files loaded successfully")
+except Exception as e:
+    logger.error(f"Failed to load metadata JSON files: {str(e)}")
+    raise
 
 # Initialize NLTK lemmatizer
 try:
@@ -154,7 +159,7 @@ def ratelimit_handler(e):
 @limiter.limit("60 per hour")
 def search_content():
     query = re.sub(r'[^\w\s.,!?]', '', request.args.get('q', '')).strip()
-    content_type = request.args.get('content_type', '').strip()
+    content_type = request.args.get('content_type', '').strip().lower()
     page = max(1, int(request.args.get('page', 1)))
     size = max(1, min(100, int(request.args.get('per_page', 5))))
 
@@ -175,15 +180,20 @@ def search_content():
             collection = weaviate_client.collections.get("Content")
             from weaviate.classes.query import Filter
             filters = Filter.by_property("type").equal(content_type)
+            # Define properties based on content_type
+            properties = ["content_id", "title", "description", "url"]
+            if content_type == 'stories':
+                properties.append("image")
             results = collection.query.near_vector(
                 near_vector=vector,
-                limit=size * page,
+                limit=size * page + 10,
                 filters=filters,
                 return_metadata=["distance"],
-                return_properties=["content_id", "title", "description", "image", "url"]
+                return_properties=properties
             )
+            logger.info(f"Query results: {len(results.objects)} objects found for query='{query}', content_type='{content_type}'")
             total = len(results.objects)
-            paginated = results.objects[(page - 1) * size:page * size]
+            paginated = results.objects[(page - 1) * size:page * page]
 
             items = []
             for obj in paginated:
@@ -198,6 +208,7 @@ def search_content():
                 elif content_type in ['songs', 'poems']:
                     item['url'] = obj.properties.get("url", "")
                 items.append(item)
+                logger.info(f"Item: {item}")
 
             logger.info(f"Search completed: query='{query}', content_type='{content_type}', page={page}, total={total}")
             return jsonify({"results": items, "total": total})
@@ -211,7 +222,7 @@ def search_content():
 @limiter.limit("30 per hour")
 def rag_answer_content():
     query = re.sub(r'[^\w\s.,!?]', '', request.args.get('q', '')).strip()
-    content_type = request.args.get('content_type', '').strip()
+    content_type = request.args.get('content_type', '').strip().lower()
     reroll = request.args.get('reroll', '').lower().startswith('yes')
 
     if not query or not content_type or content_type not in ['songs', 'poems', 'stories']:
@@ -238,6 +249,7 @@ def rag_answer_content():
                 return_metadata=["distance"],
                 return_properties=["content_id", "text", "description"]
             )
+            logger.info(f"RAG query results: {len(results.objects)} objects found for query='{query}', content_type='{content_type}'")
         except Exception as e:
             logger.error(f"Weaviate query failed: {str(e)}")
             return jsonify({"error": "Weaviate query failed", "details": str(e)}), 500
