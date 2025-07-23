@@ -183,7 +183,7 @@ def search_content():
             properties = ["content_id", "title", "description", "url"]
             results = collection.query.near_vector(
                 near_vector=vector,
-                limit=1 if content_type in ['songs', 'poems'] else 5,
+                limit=50,  # Increased to fetch all relevant results
                 filters=filters,
                 return_metadata=["distance"],
                 return_properties=properties
@@ -195,11 +195,6 @@ def search_content():
             items = []
             for obj in paginated:
                 content_id = obj.properties.get("content_id", str(obj.uuid))
-                if content_type == 'stories' and obj.metadata.distance > 0.5:
-                    logger.info(f"Skipping story {content_id} with distance {obj.metadata.distance}")
-                    if content_id == "9":
-                        logger.info(f"Specifically skipping content_id: 9, Title: {obj.properties.get('title')}, Distance: {obj.metadata.distance}")
-                    continue
                 logger.info(f"Processing item: Content ID: {content_id}, Distance: {obj.metadata.distance}")
                 item = {
                     "content_id": content_id,
@@ -215,7 +210,7 @@ def search_content():
                 logger.info(f"Item: {item}")
 
             logger.info(f"Search completed: query='{query}', content_type='{content_type}', page={page}, total={total}, returned={len(items)}")
-            return jsonify({"results": items, "total": len(items)})
+            return jsonify({"results": items, "total": total})
         except Exception as e:
             logger.error(f"Weaviate query failed for {content_type}: {str(e)}")
             return jsonify({"error": "Search service unavailable", "details": str(e)}), 500
@@ -248,7 +243,7 @@ def rag_answer_content():
             filters = Filter.by_property("type").equal(content_type)
             results = collection.query.near_vector(
                 near_vector=vector,
-                limit=5,
+                limit=50,  # Increased for RAG context
                 filters=filters,
                 return_metadata=["distance"],
                 return_properties=["content_id", "text", "description"]
