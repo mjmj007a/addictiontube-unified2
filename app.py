@@ -161,7 +161,7 @@ def search_content():
     query = re.sub(r'[^\w\s.,!?]', '', request.args.get('q', '')).strip()
     content_type = request.args.get('content_type', '').strip().lower()
     page = max(1, int(request.args.get('page', 1)))
-    size = max(1, min(100, int(request.args.get('per_page', 5))))
+    size = max(1, min(100, int(request.args.get('per_page', 1))))
 
     if not query or not content_type or content_type not in ['songs', 'poems', 'stories']:
         logger.error(f"Invalid request: query='{query}', content_type='{content_type}'")
@@ -180,38 +180,42 @@ def search_content():
             collection = weaviate_client.collections.get("Content")
             from weaviate.classes.query import Filter
             filters = Filter.by_property("type").equal(content_type)
-            # Define properties based on content_type
             properties = ["content_id", "title", "description", "url"]
-            if content_type == 'stories':
-                properties.append("image")
             results = collection.query.near_vector(
                 near_vector=vector,
-                limit=size * page + 10,
+                limit=1 if content_type in ['songs', 'poems'] else 5,
                 filters=filters,
                 return_metadata=["distance"],
                 return_properties=properties
             )
             logger.info(f"Query results: {len(results.objects)} objects found for query='{query}', content_type='{content_type}'")
             total = len(results.objects)
-            paginated = results.objects[(page - 1) * size:page * page]
+            paginated = results.objects[(page - 1) * size:page * size]
 
             items = []
             for obj in paginated:
+                content_id = obj.properties.get("content_id", str(obj.uuid))
+                if content_type == 'stories' and obj.metadata.distance > 0.5:
+                    logger.info(f"Skipping story {content_id} with distance {obj.metadata.distance}")
+                    if content_id == "9":
+                        logger.info(f"Specifically skipping content_id: 9, Title: {obj.properties.get('title')}, Distance: {obj.metadata.distance}")
+                    continue
+                logger.info(f"Processing item: Content ID: {content_id}, Distance: {obj.metadata.distance}")
                 item = {
-                    "content_id": obj.properties.get("content_id", str(obj.uuid)),
+                    "content_id": content_id,
                     "score": obj.metadata.distance,
                     "title": strip_html(obj.properties.get("title", "N/A")),
                     "description": strip_html(obj.properties.get("description", ""))
                 }
                 if content_type == 'stories':
-                    item['image'] = obj.properties.get("image", "")
+                    item['image'] = obj.properties.get("url", "")
                 elif content_type in ['songs', 'poems']:
                     item['url'] = obj.properties.get("url", "")
                 items.append(item)
                 logger.info(f"Item: {item}")
 
-            logger.info(f"Search completed: query='{query}', content_type='{content_type}', page={page}, total={total}")
-            return jsonify({"results": items, "total": total})
+            logger.info(f"Search completed: query='{query}', content_type='{content_type}', page={page}, total={total}, returned={len(items)}")
+            return jsonify({"results": items, "total": len(items)})
         except Exception as e:
             logger.error(f"Weaviate query failed for {content_type}: {str(e)}")
             return jsonify({"error": "Search service unavailable", "details": str(e)}), 500
